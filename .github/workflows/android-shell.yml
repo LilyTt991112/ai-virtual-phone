@@ -36,7 +36,7 @@ jobs:
       - name: Decode keystore (optional)
         if: ${{ env.SHELL_KEYSTORE_BASE64 != '' }}
         run: |
-          echo "$SHELL_KEYSTORE_BASE64" | base64 -di > /tmp/shell.keystore
+          python3 -c "import os, base64; s = ''.join(os.environ.get('SHELL_KEYSTORE_BASE64', '').split()); s += '=' * ((4 - len(s) % 4) % 4); open('/tmp/shell.keystore', 'wb').write(base64.b64decode(s))"
           echo "SHELL_KEYSTORE_FILE=/tmp/shell.keystore" >> "$GITHUB_ENV"
 
       - name: Build APKs
