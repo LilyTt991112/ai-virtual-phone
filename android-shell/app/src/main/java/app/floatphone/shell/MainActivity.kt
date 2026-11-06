@@ -3,6 +3,7 @@ package app.floatphone.shell
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,10 +12,13 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Base64
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -151,17 +155,17 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-// 备份导出等下载：支持 blob 内存文件与常规文件直接落到公共下载目录
+        // 备份导出等下载：支持 blob 内存文件与常规文件直接落到公共下载目录
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
-                val fileName = if (contentDisposition?.contains("filename=") == true) {
-                    android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
+                val fileName = if (contentDisposition != null && contentDisposition.contains("filename=")) {
+                    URLUtil.guessFileName(url, contentDisposition, mimeType)
                 } else {
                     "float-backup-${System.currentTimeMillis()}.json"
                 }
 
                 if (url.startsWith("blob:")) {
-                    Toast.makeText(this, "正在保存备份到系统下载目录…", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "正在保存备份到「下载」目录…", Toast.LENGTH_SHORT).show()
                     val js = """
                         (function() {
                             var xhr = new XMLHttpRequest();
@@ -214,25 +218,35 @@ class MainActivity : AppCompatActivity() {
     private fun saveBase64ToDownloads(base64Data: String, fileName: String, mimeType: String?) {
         try {
             val pureBase64 = if (base64Data.contains(",")) base64Data.substringAfter(",") else base64Data
-            val bytes = android.util.Base64.decode(pureBase64, android.util.Base64.DEFAULT)
-            val values = android.content.ContentValues().apply {
-                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType ?: "application/json")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            val bytes = Base64.decode(pureBase64, Base64.DEFAULT)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType ?: "application/json")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                 }
-            }
-            val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            if (uri != null) {
-                contentResolver.openOutputStream(uri)?.use { stream ->
-                    stream.write(bytes)
-                }
-                runOnUiThread {
-                    Toast.makeText(this, "✅ 备份已成功保存到手机「下载(Download)」目录！", Toast.LENGTH_LONG).show()
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    contentResolver.openOutputStream(uri)?.use { stream ->
+                        stream.write(bytes)
+                    }
+                    runOnUiThread {
+                        Toast.makeText(this, "✅ 备份已成功保存到手机「下载(Download)」目录！", Toast.LENGTH_LONG).show()
+                    }
+                } else {
+                    runOnUiThread {
+                        Toast.makeText(this, "保存失败，请检查存储权限", Toast.LENGTH_SHORT).show()
+                    }
                 }
             } else {
+                @Suppress("DEPRECATION")
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!dir.exists()) dir.mkdirs()
+                val file = java.io.File(dir, fileName)
+                file.writeBytes(bytes)
                 runOnUiThread {
-                    Toast.makeText(this, "保存文件失败，请检查存储权限", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "✅ 备份已成功保存到手机「下载(Download)」目录！", Toast.LENGTH_LONG).show()
                 }
             }
         } catch (e: Exception) {
