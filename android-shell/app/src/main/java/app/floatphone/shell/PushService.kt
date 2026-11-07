@@ -25,11 +25,9 @@ import kotlin.concurrent.thread
 /**
  * 推送前台服务：不依赖 Google 服务的自建长连接。
  *
- * 原理：用 WebView 里已登录的站点 Cookie 调用站点接口拿到
- * Supabase 地址 / anon key / 当前用户 id，然后用 OkHttp WebSocket
- * 直连 Supabase Realtime，订阅个人频道 shellpush:<userId>。
- * 服务端（push-generate / 测试按钮）发离线消息时会向该频道广播一份，
- * 本服务收到即弹系统通知——App 被杀也能收（前台服务存活期间）。
+ * 原理：优先使用本地个人云配置（单机自部署模式），
+ * 或用 WebView 里已登录的站点 Cookie 调接口拿到配置（多用户模式），
+ * 然后用 OkHttp WebSocket 直连 Supabase Realtime 订阅个人频道。
  */
 class PushService : Service() {
 
@@ -38,13 +36,34 @@ class PushService : Service() {
         private const val CH_MESSAGES = "shell_messages"
         private const val CH_CALLS = "shell_calls"
         private const val NOTIF_FG_ID = 1
+        private const val PREF_NAME = "shell_push_prefs"
         private var running = false
+        private var activeService: PushService? = null
 
         fun start(context: Context) {
             if (running) return
             val intent = Intent(context, PushService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
+        }
+
+        /** 供 MainActivity 收到网页配置时动态热更新 */
+        fun updateConfigFromWeb(context: Context, rawJson: String) {
+            runCatching {
+                val obj = JSONObject(rawJson)
+                val url = obj.optString("supabaseUrl").ifEmpty { obj.optString("url") }
+                val key = obj.optString("anonKey").ifEmpty { obj.optString("key") }
+                val userId = obj.optString("userId").ifEmpty { "self_hosted_user" }
+                if (url.isNotEmpty() && key.isNotEmpty()) {
+                    val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                    sp.edit()
+                        .putString("supabase_url", url)
+                        .putString("anon_key", key)
+                        .putString("user_id", userId)
+                        .apply()
+                    activeService?.reconnectWithLocalConfig()
+                }
+            }
         }
     }
 
@@ -64,6 +83,7 @@ class PushService : Service() {
     override fun onCreate() {
         super.onCreate()
         running = true
+        activeService = this
         createChannels()
         startForeground(NOTIF_FG_ID, buildKeepAliveNotification("等待连接…"))
         thread(name = "shell-push-loop") { connectionLoop() }
@@ -74,8 +94,13 @@ class PushService : Service() {
     override fun onDestroy() {
         stopped = true
         running = false
+        activeService = null
         socket?.cancel()
         super.onDestroy()
+    }
+
+    fun reconnectWithLocalConfig() {
+        socket?.cancel()
     }
 
     // ── 连接循环：拿配置 → 连 WS → 断线退避重连 ──
@@ -84,7 +109,8 @@ class PushService : Service() {
         while (!stopped) {
             val config = fetchConfig()
             if (config == null) {
-                updateKeepAlive("未登录或站点不可达，稍后重试")
+                // 单机模式下如果没有从网络拿到，但本地有个人云运行，显示准备就绪
+                updateKeepAlive("小手机服务运行中（待命）")
                 sleepSec(60); continue
             }
             updateKeepAlive("已连接，等待角色消息")
@@ -99,8 +125,18 @@ class PushService : Service() {
 
     private data class PushConfig(val supabaseUrl: String, val anonKey: String, val userId: String)
 
-    /** 借 WebView 的登录 Cookie 调站点接口获取连接参数。 */
+    /** 优先读本地单机配置；若无则借 WebView Cookie 调接口获取（多用户模式）。 */
     private fun fetchConfig(): PushConfig? = runCatching {
+        // 1. 优先读取通过本地内存桥接同步过来的配置（单机模式）
+        val sp = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val localUrl = sp.getString("supabase_url", null)
+        val localKey = sp.getString("anon_key", null)
+        val localUser = sp.getString("user_id", "self_hosted_user") ?: "self_hosted_user"
+        if (!localUrl.isNullOrEmpty() && !localKey.isNullOrEmpty()) {
+            return@runCatching PushConfig(localUrl.trimEnd('/'), localKey, localUser)
+        }
+
+        // 2. 本地暂无时，尝试原版 Cookie 接口（多用户模式兼容）
         val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL) ?: return null
 
         fun getJson(path: String): JSONObject? {
@@ -127,11 +163,7 @@ class PushService : Service() {
         PushConfig(url.trimEnd('/'), key, userId)
     }.getOrNull()
 
-    /**
-     * 在站点注册一条合成推送订阅（endpoint = shell:<userId>）。
-     * 作用是让离线消息排期的"账号已订阅"门控放行，并让服务端知道
-     * 要往 shellpush 频道广播；服务端不会对它做 Web Push 投递。
-     */
+    /** 在站点注册合成推送订阅 */
     private fun registerShellSubscription(cookie: String, userId: String) {
         if (shellSubRegistered) return
         runCatching {
@@ -179,7 +211,6 @@ class PushService : Service() {
                         ),
                     )
                 webSocket.send(join.toString())
-                // Phoenix 心跳（OkHttp pingInterval 是 TCP 层，这里是协议层）
                 thread(name = "shell-push-heartbeat") {
                     while (!done && !stopped) {
                         sleepSec(25)
@@ -207,7 +238,6 @@ class PushService : Service() {
                     val body = payload.optJSONObject("payload") ?: return
                     val title = body.optString("title").ifEmpty { "小手机" }
                     val text2 = body.optString("body").ifEmpty { "有新消息" }
-                    // 来电：全屏来电通知（任何一步失败回落普通通知，主路不受影响）
                     if (body.optString("kind") == "call") {
                         val shown = runCatching {
                             showIncomingCallNotification(
@@ -262,7 +292,7 @@ class PushService : Service() {
             NotificationChannel(CH_CALLS, "角色来电", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "角色打来的语音电话（只振动，不响铃）"
                 setSound(null, null)
-                enableVibration(false) // 振动由 CallAlert 循环控制，渠道自带的一次性振动关掉
+                enableVibration(false)
             },
         )
     }
@@ -288,10 +318,6 @@ class PushService : Service() {
             .notify(NOTIF_FG_ID, buildKeepAliveNotification(text))
     }
 
-    /**
-     * 全屏来电通知：锁屏/熄屏直接弹 IncomingCallActivity，亮屏时是带
-     * 接听/拒接按钮的 heads-up。振动循环 + 55s 超时未接由 CallAlert 管。
-     */
     private fun showIncomingCallNotification(characterName: String, sessionId: String, callTs: Long) {
         val fullScreen = Intent(this, IncomingCallActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -328,7 +354,6 @@ class PushService : Service() {
             .build()
         getSystemService(NotificationManager::class.java).notify(CallAlert.NOTIF_CALL_ID, notification)
         CallAlert.start(this, sessionId, characterName) {
-            // 超时未接：收场 + 换一条"未接来电"普通通知（正文消息本来就会进聊天）
             CallAlert.stop(this)
             runCatching { showMissedCallNotification(characterName) }
         }
