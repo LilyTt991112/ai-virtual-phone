@@ -86,7 +86,7 @@ class MainActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_DEFAULT
             allowFileAccess = false
-            userAgentString = "${userAgentString} FloatShell/$VERSION"
+            userAgentString = "$userAgentString FloatShell/$VERSION"
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
@@ -149,7 +149,7 @@ class MainActivity : AppCompatActivity() {
             runCatching {
                 if (url.startsWith("blob:") || url.startsWith("data:")) {
                     // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
-                    Toast.makeText(this, "正在导出...", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
                     return@DownloadListener
                 }
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
@@ -171,39 +171,21 @@ class MainActivity : AppCompatActivity() {
             private var lastBackTime = 0L
 
             override fun handleOnBackPressed() {
-                val jsBack = """
-                    (function() {
-                        const selectors = [
-                            'button[aria-label="返回"]',
-                            'button[aria-label="关闭"]',
-                            'button.back-btn',
-                            '[data-action="back"]',
-                            'button:has(svg.lucide-chevron-left)',
-                            'button:has(svg.lucide-arrow-left)'
-                        ];
-                        for (let s of selectors) {
-                            try {
-                                const el = document.querySelector(s);
-                                if (el && el.offsetParent !== null) {
-                                    el.click();
-                                    return true;
-                                }
-                            } catch(e) {}
-                        }
-                        const buttons = Array.from(document.querySelectorAll('button, a'));
-                        for (let i = buttons.length - 1; i >= 0; i--) {
-                            const b = buttons[i];
-                            if (b.offsetParent !== null) {
-                                const text = b.innerText?.trim();
-                                if (text === '‹' || text === '返回' || text === '<') {
-                                    b.click();
-                                    return true;
-                                }
-                            }
-                        }
-                        return false;
-                    })();
-                """.trimIndent()
+                val jsBack = "(function(){" +
+                    "var selectors=['button[aria-label=\"返回\"]','button[aria-label=\"关闭\"]','button.back-btn','[data-action=\"back\"]','button:has(svg.lucide-chevron-left)','button:has(svg.lucide-arrow-left)'];" +
+                    "for(var i=0;i<selectors.length;i++){" +
+                    "try{var el=document.querySelector(selectors[i]);if(el&&el.offsetParent!==null){el.click();return true;}}catch(e){}" +
+                    "}" +
+                    "var buttons=Array.from(document.querySelectorAll('button, a'));" +
+                    "for(var j=buttons.length-1;j>=0;j--){" +
+                    "var b=buttons[j];" +
+                    "if(b.offsetParent!==null){" +
+                    "var text=b.innerText?b.innerText.trim():'';" +
+                    "if(text==='‹'||text==='返回'||text==='<'){b.click();return true;}" +
+                    "}" +
+                    "}" +
+                    "return false;" +
+                    "})();"
 
                 webView.evaluateJavascript(jsBack) { handled ->
                     if (handled == "true") return@evaluateJavascript
@@ -268,38 +250,32 @@ class MainActivity : AppCompatActivity() {
      * 同时将 `push_account_subscribed_v1` 设为已订阅，防止网页端拦截报错“请先打开离线推送”。
      */
     private fun injectPushCheck() {
-        val js = """
-            (function() {
-                if (window.__shellPushSyncTimer) return;
-                function syncFromIdb() {
-                    try {
-                        const req = indexedDB.open('AiPhoneKvDB');
-                        req.onsuccess = function(e) {
-                            const db = e.target.result;
-                            if (!db.objectStoreNames.contains('entries')) return;
-                            const tx = db.transaction('entries', 'readwrite');
-                            const store = tx.objectStore('entries');
-                            const getBackup = store.get('ai_phone_cloud_backup_config_v1');
-                            getBackup.onsuccess = function() {
-                                const row = getBackup.result;
-                                if (row && row.value) {
-                                    if (window.AndroidShell && window.AndroidShell.syncPushConfig) {
-                                        window.AndroidShell.syncPushConfig(row.value);
-                                    }
-                                    // 同步放行网页端的“账号已订阅”门控阀门
-                                    store.put({
-                                        key: 'push_account_subscribed_v1',
-                                        value: JSON.stringify({ subscribed: true, checkedAt: Date.now() })
-                                    });
-                                }
-                            };
-                        };
-                    } catch(err) {}
-                }
-                syncFromIdb();
-                window.__shellPushSyncTimer = setInterval(syncFromIdb, 15000);
-            })();
-        """.trimIndent()
+        val js = "(function(){" +
+            "if(window.__shellPushSyncTimer)return;" +
+            "function syncFromIdb(){" +
+            "try{" +
+            "var req=indexedDB.open('AiPhoneKvDB');" +
+            "req.onsuccess=function(e){" +
+            "var db=e.target.result;" +
+            "if(!db.objectStoreNames.contains('entries'))return;" +
+            "var tx=db.transaction('entries','readwrite');" +
+            "var store=tx.objectStore('entries');" +
+            "var getBackup=store.get('ai_phone_cloud_backup_config_v1');" +
+            "getBackup.onsuccess=function(){" +
+            "var row=getBackup.result;" +
+            "if(row&&row.value){" +
+            "if(window.AndroidShell&&window.AndroidShell.syncPushConfig){" +
+            "window.AndroidShell.syncPushConfig(row.value);" +
+            "}" +
+            "store.put({key:'push_account_subscribed_v1',value:JSON.stringify({subscribed:true,checkedAt:Date.now()})});" +
+            "}" +
+            "};" +
+            "};" +
+            "}catch(err){}" +
+            "}" +
+            "syncFromIdb();" +
+            "window.__shellPushSyncTimer=setInterval(syncFromIdb,15000);" +
+            "})();"
         webView.evaluateJavascript(js, null)
     }
 
