@@ -49,7 +49,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val notifPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
+        ActivityResultContracts.RequestMultiplePermissions(),
     ) {
         PushService.start(this)
     }
@@ -86,7 +86,7 @@ class MainActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_DEFAULT
             allowFileAccess = false
-            userAgentString = "$userAgentString FloatShell/$VERSION"
+            userAgentString = "${userAgentString} FloatShell/$VERSION"
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
@@ -111,7 +111,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                // 页面加载完成后，向网页注入一段自检逻辑，在单机模式下自动同步离线通道
+                // 页面加载完成后，从 IndexedDB (AiPhoneKvDB) 提取个人云配置同步给原生推送服务
                 injectPushCheck()
             }
         }
@@ -149,7 +149,7 @@ class MainActivity : AppCompatActivity() {
             runCatching {
                 if (url.startsWith("blob:") || url.startsWith("data:")) {
                     // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
-                    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "正在导出...", Toast.LENGTH_SHORT).show()
                     return@DownloadListener
                 }
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
@@ -195,7 +195,7 @@ class MainActivity : AppCompatActivity() {
                             const b = buttons[i];
                             if (b.offsetParent !== null) {
                                 const text = b.innerText?.trim();
-                                if (text === '<' || text === '返回' || text === '‹') {
+                                if (text === '‹' || text === '返回' || text === '<') {
                                     b.click();
                                     return true;
                                 }
@@ -243,37 +243,61 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensurePushService() {
+        val perms = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            perms.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (perms.isNotEmpty()) {
+            notifPermissionLauncher.launch(perms.toTypedArray())
         } else {
             PushService.start(this)
         }
     }
 
-    /** 检查并在单机模式下将本地个人云配置同步给原生推送服务 */
+    /**
+     * 从网页的 IndexedDB (AiPhoneKvDB -> entries) 中读取个人云配置
+     * `ai_phone_cloud_backup_config_v1` 并同步给原生 PushService，
+     * 同时将 `push_account_subscribed_v1` 设为已订阅，防止网页端拦截报错“请先打开离线推送”。
+     */
     private fun injectPushCheck() {
         val js = """
             (function() {
-                try {
-                    // 读取本地存储中的个人云配置，若存在则同步给安卓壳
-                    let cfg = localStorage.getItem('personal_cloud_config') || localStorage.getItem('supabase_cloud_config');
-                    if (!cfg) {
-                        for (let i = 0; i < localStorage.length; i++) {
-                            const k = localStorage.key(i);
-                            const v = localStorage.getItem(k);
-                            if (v && v.includes('supabase.co')) {
-                                cfg = v;
-                                break;
-                            }
-                        }
-                    }
-                    if (cfg && window.AndroidShell && window.AndroidShell.syncPushConfig) {
-                        window.AndroidShell.syncPushConfig(cfg);
-                    }
-                } catch(e) {}
+                if (window.__shellPushSyncTimer) return;
+                function syncFromIdb() {
+                    try {
+                        const req = indexedDB.open('AiPhoneKvDB');
+                        req.onsuccess = function(e) {
+                            const db = e.target.result;
+                            if (!db.objectStoreNames.contains('entries')) return;
+                            const tx = db.transaction('entries', 'readwrite');
+                            const store = tx.objectStore('entries');
+                            const getBackup = store.get('ai_phone_cloud_backup_config_v1');
+                            getBackup.onsuccess = function() {
+                                const row = getBackup.result;
+                                if (row && row.value) {
+                                    if (window.AndroidShell && window.AndroidShell.syncPushConfig) {
+                                        window.AndroidShell.syncPushConfig(row.value);
+                                    }
+                                    // 同步放行网页端的“账号已订阅”门控阀门
+                                    store.put({
+                                        key: 'push_account_subscribed_v1',
+                                        value: JSON.stringify({ subscribed: true, checkedAt: Date.now() })
+                                    });
+                                }
+                            };
+                        };
+                    } catch(err) {}
+                }
+                syncFromIdb();
+                window.__shellPushSyncTimer = setInterval(syncFromIdb, 15000);
             })();
         """.trimIndent()
         webView.evaluateJavascript(js, null)
