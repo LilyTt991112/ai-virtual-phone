@@ -18,6 +18,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -198,15 +199,16 @@ class PushService : Service() {
                 .header("x-ai-phone-service-key", key)
                 .post(body)
                 .build()
-            client.newCall(gwRequest).execute().use { response ->
-                if (response.isSuccessful) {
-                    shellSubRegistered = true
-                    return
-                }
+            val gwOk = client.newCall(gwRequest).execute().use { response ->
+                response.isSuccessful
+            }
+            if (gwOk) {
+                shellSubRegistered = true
+                return@runCatching
             }
 
             // 兜底：直接向 PostgREST push_subscriptions 表 upsert
-            val restBody = org.json.JSONArray().put(
+            val restBody = JSONArray().put(
                 JSONObject()
                     .put("endpoint", "shell:$userId")
                     .put("user_id", userId)
