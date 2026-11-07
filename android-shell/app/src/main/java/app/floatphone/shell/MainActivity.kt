@@ -6,7 +6,6 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +17,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -25,56 +25,46 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.view.WindowCompat
 
-/**
- * Float 小手机安卓壳：全屏 WebView 直接加载线上站点。
- * 网页每次部署即时生效，本壳只负责原生能力（推送长连接、文件上下行、外链）。
- */
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        val SITE_URL: String = BuildConfig.SITE_URL
         const val VERSION = "1.0.0"
-        /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
-        const val EXTRA_OPEN_URL = "open_url"
+        /** 网页版地址；替换为你自己的 Netlify / Vercel 部署域名 */
+        const val SITE_URL = "https://delightful-sopapillas-a8b9d5.netlify.app"
+        /** Deep link / Push 唤起时传递的直达 URL */
+        const val EXTRA_OPEN_URL = "app.floatphone.shell.OPEN_URL"
     }
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
-    private var lastBackPressTime: Long = 0
+    private var pendingWebPermissionRequest: android.webkit.PermissionRequest? = null
 
     private val fileChooserLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
+        ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        val callback = filePathCallback ?: return@registerForActivityResult
+        val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+        filePathCallback?.onReceiveValue(uris)
         filePathCallback = null
-        val data = result.data?.data
-        callback.onReceiveValue(if (data != null) arrayOf(data) else emptyArray())
     }
 
     private val notifPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        // 单机自托管模式：跳过 PushService 启动，杜绝后台报错常驻通知
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        PushService.start(this)
     }
 
-    // 网页侧 getUserMedia（通话按住说话、语音条录音、视频通话摄像头）触发的
-    // WebView 权限请求：先要系统运行时权限，拿到后再转授给页面。
-    // 不实现 onPermissionRequest 时 WebView 会静默拒绝，页面永远拿不到麦克风。
-    private var pendingWebPermissionRequest: android.webkit.PermissionRequest? = null
-
     private val webPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ ->
-        val request = pendingWebPermissionRequest ?: return@registerForActivityResult
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        val req = pendingWebPermissionRequest ?: return@registerForActivityResult
         pendingWebPermissionRequest = null
-        val granted = request.resources.filter { resource ->
-            webResourcePermissions(resource).all {
-                ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-            }
+        if (grants.values.all { it }) {
+            val supported = req.resources.filter { webResourcePermissions(it).isNotEmpty() }
+            req.grant(supported.toTypedArray())
+        } else {
+            req.deny()
         }
-        if (granted.isEmpty()) request.deny() else request.grant(granted.toTypedArray())
     }
 
     private fun webResourcePermissions(resource: String): List<String> = when (resource) {
@@ -86,19 +76,15 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        WindowCompat.setDecorFitsSystemWindows(window, true)
-        // 音量键默认调媒体流：WebView 里的语音条/TTS 都走媒体流播放，
-        // 不设的话短音频没在播时按键调的是铃声，用户感觉"音量键无效、声音巨大"
-        volumeControlStream = AudioManager.STREAM_MUSIC
+        setContentView(R.layout.activity_main)
 
-        webView = WebView(this)
-        setContentView(webView)
-
+        webView = findViewById(R.id.webView)
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
+            cacheMode = WebSettings.LOAD_DEFAULT
             allowFileAccess = false
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
@@ -121,6 +107,12 @@ class MainActivity : AppCompatActivity() {
                 return runCatching {
                     startActivity(Intent(Intent.ACTION_VIEW, url)); true
                 }.getOrDefault(true)
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                // 页面加载完成后，向网页注入一段自检逻辑，在单机模式下自动同步离线通道
+                injectPushCheck()
             }
         }
 
@@ -174,53 +166,57 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        // 手机返回键智能回退：单页应用优先返回上一层界面，顶层主界面时双击退出防误触
+        // 物理返回键处理：优先通过 JS 查找并点击网页顶层返回按钮；根界面双击退出防误触
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            private var lastBackTime = 0L
+
             override fun handleOnBackPressed() {
-                // 1. 优先尝试点击页面内处于顶层的返回箭头或关闭按钮（从聊天回退到列表，从列表回退到主页）
-                val backScript = """
+                val jsBack = """
                     (function() {
-                        const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                        const selectors = [
+                            'button[aria-label="返回"]',
+                            'button[aria-label="关闭"]',
+                            'button.back-btn',
+                            '[data-action="back"]',
+                            'button:has(svg.lucide-chevron-left)',
+                            'button:has(svg.lucide-arrow-left)'
+                        ];
+                        for (let s of selectors) {
+                            try {
+                                const el = document.querySelector(s);
+                                if (el && el.offsetParent !== null) {
+                                    el.click();
+                                    return true;
+                                }
+                            } catch(e) {}
+                        }
+                        const buttons = Array.from(document.querySelectorAll('button, a'));
                         for (let i = buttons.length - 1; i >= 0; i--) {
-                            const btn = buttons[i];
-                            if (btn.offsetParent === null) continue;
-                            const text = (btn.innerText || btn.textContent || '').trim();
-                            const label = (btn.getAttribute('aria-label') || btn.getAttribute('title') || '').trim();
-                            const html = btn.innerHTML || '';
-                            if (text === '<' || text === '‹' || text === '返回' || 
-                                label.includes('返回') || label.includes('Back') || 
-                                label.includes('关闭') || label.includes('Close')) {
-                                btn.click();
-                                return true;
-                            }
-                            if (/chevron-left|arrow-left|lucide-chevron-left/i.test(html)) {
-                                btn.click();
-                                return true;
+                            const b = buttons[i];
+                            if (b.offsetParent !== null) {
+                                const text = b.innerText?.trim();
+                                if (text === '<' || text === '返回' || text === '‹') {
+                                    b.click();
+                                    return true;
+                                }
                             }
                         }
                         return false;
-                    })()
+                    })();
                 """.trimIndent()
 
-                webView.evaluateJavascript(backScript) { handled ->
-                    if (handled == "true") {
-                        // 网页内部已成功回退一层（例如从聊天回到列表）
-                        return@evaluateJavascript
-                    }
-
-                    // 2. 如果页面内部已无处可退，且有浏览器历史记录
+                webView.evaluateJavascript(jsBack) { handled ->
+                    if (handled == "true") return@evaluateJavascript
                     if (webView.canGoBack()) {
                         webView.goBack()
                         return@evaluateJavascript
                     }
-
-                    // 3. 已经在小手机最外层桌面：双击返回键退出防误触
                     val now = System.currentTimeMillis()
-                    if (now - lastBackPressTime < 2000) {
+                    if (now - lastBackTime < 2000) {
                         moveTaskToBack(true)
                     } else {
-                        lastBackPressTime = now
-                        Toast.makeText(this@MainActivity, "再按一次返回桌面", Toast.LENGTH_SHORT).show()
+                        lastBackTime = now
+                        Toast.makeText(this@MainActivity, "再按一次退出小手机", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
@@ -247,8 +243,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensurePushService() {
-        // 单机自托管模式：彻底停用 PushService，杜绝后台报错常驻通知
-        /*
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
@@ -257,7 +251,32 @@ class MainActivity : AppCompatActivity() {
         } else {
             PushService.start(this)
         }
-        */
+    }
+
+    /** 检查并在单机模式下将本地个人云配置同步给原生推送服务 */
+    private fun injectPushCheck() {
+        val js = """
+            (function() {
+                try {
+                    // 读取本地存储中的个人云配置，若存在则同步给安卓壳
+                    let cfg = localStorage.getItem('personal_cloud_config') || localStorage.getItem('supabase_cloud_config');
+                    if (!cfg) {
+                        for (let i = 0; i < localStorage.length; i++) {
+                            const k = localStorage.key(i);
+                            const v = localStorage.getItem(k);
+                            if (v && v.includes('supabase.co')) {
+                                cfg = v;
+                                break;
+                            }
+                        }
+                    }
+                    if (cfg && window.AndroidShell && window.AndroidShell.syncPushConfig) {
+                        window.AndroidShell.syncPushConfig(cfg);
+                    }
+                } catch(e) {}
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
     }
 
     override fun onDestroy() {
@@ -292,6 +311,12 @@ class MainActivity : AppCompatActivity() {
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 )
             }
+        }
+
+        /** 供网页在单机模式下直接将个人云配置在手机内存内同步给原生推送服务 */
+        @JavascriptInterface
+        fun syncPushConfig(rawJson: String) {
+            PushService.updateConfigFromWeb(this@MainActivity, rawJson)
         }
     }
 }
