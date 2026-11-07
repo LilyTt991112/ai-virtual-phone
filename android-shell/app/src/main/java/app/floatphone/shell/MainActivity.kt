@@ -3,7 +3,6 @@ package app.floatphone.shell
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -12,13 +11,10 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.provider.MediaStore
 import android.provider.Settings
-import android.util.Base64
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
-import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -46,6 +42,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var lastBackPressTime: Long = 0
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -58,8 +55,8 @@ class MainActivity : AppCompatActivity() {
 
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) PushService.start(this)
+    ) { _ ->
+        // 单机自托管模式：跳过 PushService 启动，杜绝后台报错常驻通知
     }
 
     // 网页侧 getUserMedia（通话按住说话、语音条录音、视频通话摄像头）触发的
@@ -155,105 +152,83 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 备份导出等下载：支持 blob 内存文件与常规文件直接落到公共下载目录
+        // 备份导出等下载：交给系统下载管理器，落到公共下载目录
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
-                val fileName = if (contentDisposition != null && contentDisposition.contains("filename=")) {
-                    URLUtil.guessFileName(url, contentDisposition, mimeType)
-                } else {
-                    "float-backup-${System.currentTimeMillis()}.json"
-                }
-
-                if (url.startsWith("blob:")) {
-                    Toast.makeText(this, "正在保存备份到「下载」目录…", Toast.LENGTH_SHORT).show()
-                    val js = """
-                        (function() {
-                            var xhr = new XMLHttpRequest();
-                            xhr.open('GET', '$url', true);
-                            xhr.responseType = 'blob';
-                            xhr.onload = function() {
-                                if (this.status === 200) {
-                                    var reader = new FileReader();
-                                    reader.readAsDataURL(this.response);
-                                    reader.onloadend = function() {
-                                        window.AndroidShell.saveBlobData(reader.result, '$fileName', '$mimeType');
-                                    };
-                                }
-                            };
-                            xhr.send();
-                        })();
-                    """.trimIndent()
-                    webView.evaluateJavascript(js, null)
+                if (url.startsWith("blob:") || url.startsWith("data:")) {
+                    // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
+                    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
                     return@DownloadListener
                 }
-
-                if (url.startsWith("data:")) {
-                    saveBase64ToDownloads(url, fileName, mimeType)
-                    return@DownloadListener
-                }
-
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
                     addRequestHeader("User-Agent", userAgent)
                     addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
                     setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                    setDestinationInExternalPublicDir(
+                        Environment.DIRECTORY_DOWNLOADS,
+                        android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType),
+                    )
                 }
                 (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
                 Toast.makeText(this, "已开始下载到「下载」目录", Toast.LENGTH_SHORT).show()
             }
         })
 
+        // 手机返回键智能回退：单页应用优先返回上一层界面，顶层主界面时双击退出防误触
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (webView.canGoBack()) webView.goBack() else moveTaskToBack(true)
+                // 1. 优先尝试点击页面内处于顶层的返回箭头或关闭按钮（从聊天回退到列表，从列表回退到主页）
+                val backScript = """
+                    (function() {
+                        const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                        for (let i = buttons.length - 1; i >= 0; i--) {
+                            const btn = buttons[i];
+                            if (btn.offsetParent === null) continue;
+                            const text = (btn.innerText || btn.textContent || '').trim();
+                            const label = (btn.getAttribute('aria-label') || btn.getAttribute('title') || '').trim();
+                            const html = btn.innerHTML || '';
+                            if (text === '<' || text === '‹' || text === '返回' || 
+                                label.includes('返回') || label.includes('Back') || 
+                                label.includes('关闭') || label.includes('Close')) {
+                                btn.click();
+                                return true;
+                            }
+                            if (/chevron-left|arrow-left|lucide-chevron-left/i.test(html)) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                """.trimIndent()
+
+                webView.evaluateJavascript(backScript) { handled ->
+                    if (handled == "true") {
+                        // 网页内部已成功回退一层（例如从聊天回到列表）
+                        return@evaluateJavascript
+                    }
+
+                    // 2. 如果页面内部已无处可退，且有浏览器历史记录
+                    if (webView.canGoBack()) {
+                        webView.goBack()
+                        return@evaluateJavascript
+                    }
+
+                    // 3. 已经在小手机最外层桌面：双击返回键退出防误触
+                    val now = System.currentTimeMillis()
+                    if (now - lastBackPressTime < 2000) {
+                        moveTaskToBack(true)
+                    } else {
+                        lastBackPressTime = now
+                        Toast.makeText(this@MainActivity, "再按一次返回桌面", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         })
 
         // 冷启动带深链（如来电接听）直接加载目标；否则加载首页
         webView.loadUrl(consumeOpenUrl(intent) ?: SITE_URL)
         ensurePushService()
-    }
-
-    /** 保存 base64 数据直接落盘到系统公共 Download 目录 */
-    private fun saveBase64ToDownloads(base64Data: String, fileName: String, mimeType: String?) {
-        try {
-            val pureBase64 = if (base64Data.contains(",")) base64Data.substringAfter(",") else base64Data
-            val bytes = Base64.decode(pureBase64, Base64.DEFAULT)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType ?: "application/json")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                }
-                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    contentResolver.openOutputStream(uri)?.use { stream ->
-                        stream.write(bytes)
-                    }
-                    runOnUiThread {
-                        Toast.makeText(this, "✅ 备份已成功保存到手机「下载(Download)」目录！", Toast.LENGTH_LONG).show()
-                    }
-                } else {
-                    runOnUiThread {
-                        Toast.makeText(this, "保存失败，请检查存储权限", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                if (!dir.exists()) dir.mkdirs()
-                val file = java.io.File(dir, fileName)
-                file.writeBytes(bytes)
-                runOnUiThread {
-                    Toast.makeText(this, "✅ 备份已成功保存到手机「下载(Download)」目录！", Toast.LENGTH_LONG).show()
-                }
-            }
-        } catch (e: Exception) {
-            runOnUiThread {
-                Toast.makeText(this, "保存出错: ${e.message}", Toast.LENGTH_SHORT).show()
-            }
-        }
     }
 
     /** singleTask：App 已在运行时（如全屏来电页接听）通过 onNewIntent 送达深链 */
@@ -272,6 +247,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensurePushService() {
+        // 单机自托管模式：彻底停用 PushService，杜绝后台报错常驻通知
+        /*
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
@@ -280,6 +257,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             PushService.start(this)
         }
+        */
     }
 
     override fun onDestroy() {
@@ -292,12 +270,6 @@ class MainActivity : AppCompatActivity() {
     inner class ShellBridge {
         @JavascriptInterface
         fun getVersion(): String = VERSION
-
-        /** 供前端注入 JS 传递 blob base64 数据直接落盘 */
-        @JavascriptInterface
-        fun saveBlobData(base64Data: String, fileName: String, mimeType: String) {
-            saveBase64ToDownloads(base64Data, fileName, mimeType)
-        }
 
         /** 打开本应用的系统设置页（引导用户关电池限制、开自启动）。 */
         @JavascriptInterface
