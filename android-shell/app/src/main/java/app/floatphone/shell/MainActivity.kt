@@ -6,6 +6,7 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,7 +18,6 @@ import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -25,46 +25,55 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 
+/**
+ * Float 小手机安卓壳：全屏 WebView 直接加载线上站点。
+ * 网页每次部署即时生效，本壳只负责原生能力（推送长连接、文件上下行、外链）。
+ */
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        val SITE_URL: String = BuildConfig.SITE_URL
         const val VERSION = "1.0.0"
-        /** 网页版地址；替换为你自己的 Netlify / Vercel 部署域名 */
-        const val SITE_URL = "https://delightful-sopapillas-a8b9d5.netlify.app"
-        /** Deep link / Push 唤起时传递的直达 URL */
-        const val EXTRA_OPEN_URL = "app.floatphone.shell.OPEN_URL"
+        /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
+        const val EXTRA_OPEN_URL = "open_url"
     }
 
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
-    private var pendingWebPermissionRequest: android.webkit.PermissionRequest? = null
 
     private val fileChooserLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
+        ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-        filePathCallback?.onReceiveValue(uris)
+        val callback = filePathCallback ?: return@registerForActivityResult
         filePathCallback = null
+        val data = result.data?.data
+        callback.onReceiveValue(if (data != null) arrayOf(data) else emptyArray())
     }
 
     private val notifPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions(),
-    ) {
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
         PushService.start(this)
     }
 
+    // 网页侧 getUserMedia（通话按住说话、语音条录音、视频通话摄像头）触发的
+    // WebView 权限请求：先要系统运行时权限，拿到后再转授给页面。
+    // 不实现 onPermissionRequest 时 WebView 会静默拒绝，页面永远拿不到麦克风。
+    private var pendingWebPermissionRequest: android.webkit.PermissionRequest? = null
+
     private val webPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions(),
-    ) { grants ->
-        val req = pendingWebPermissionRequest ?: return@registerForActivityResult
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        val request = pendingWebPermissionRequest ?: return@registerForActivityResult
         pendingWebPermissionRequest = null
-        if (grants.values.all { it }) {
-            val supported = req.resources.filter { webResourcePermissions(it).isNotEmpty() }
-            req.grant(supported.toTypedArray())
-        } else {
-            req.deny()
+        val granted = request.resources.filter { resource ->
+            webResourcePermissions(resource).all {
+                ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+            }
         }
+        if (granted.isEmpty()) request.deny() else request.grant(granted.toTypedArray())
     }
 
     private fun webResourcePermissions(resource: String): List<String> = when (resource) {
@@ -76,15 +85,19 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+        // 音量键默认调媒体流：WebView 里的语音条/TTS 都走媒体流播放，
+        // 不设的话短音频没在播时按键调的是铃声，用户感觉"音量键无效、声音巨大"
+        volumeControlStream = AudioManager.STREAM_MUSIC
 
-        webView = findViewById(R.id.webView)
+        webView = WebView(this)
+        setContentView(webView)
+
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
-            cacheMode = WebSettings.LOAD_DEFAULT
             allowFileAccess = false
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
